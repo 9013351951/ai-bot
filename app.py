@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-"""
-app.py - ReficulBot (Option C) - Single-file hardened production-ish Flask app
-
-Features:
-- Twilio webhook for WhatsApp messages
-- Rate-limits per sender and per business (SQLite-backed)
-- Welcome messages per business
-- FAQs (global + per-business)
-- Lead capture flow (multi-step)
-- Voice note support (download + Whisper transcription)
-- OpenAI fallback with retry/backoff + ai_cache
-- AI usage tracking (monthly) + budget threshold warning
-- Dead-letter table for failed messages
-- Rotating logs
-- SQLite tuned for WAL and concurrency pragmas
-- Safe admin endpoints with constant-time token compare
-- Helpful admin diagnostics endpoints
-- Index creation migration
-"""
-
 import os
 import time
 import hashlib
@@ -36,7 +15,6 @@ from flask import Flask, request, jsonify, abort
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
-# Attempt to import OpenAI client as used earlier
 try:
     from openai import OpenAI
 except Exception:
@@ -982,11 +960,5 @@ def health():
 
 # --- run ---
 if __name__ == "__main__":
-    # sanity checks
-    if ADMIN_TOKEN == "change_this_token" or not ADMIN_TOKEN:
-        logger.error("ADMIN_TOKEN is not set or left default. Set ADMIN_TOKEN env var before running in production.")
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY not set. OpenAI features will be disabled.")
-    logger.info("Starting app on port %s", PORT)
-    # Use threaded=True for dev; in production use gunicorn with worker count tuned to your environment.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    logging.info("Starting app on port %s", PORT)
+    app.run(host="0.0.0.0", port=PORT)
