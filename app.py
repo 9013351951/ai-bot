@@ -14,16 +14,25 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, request, jsonify, abort
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
+from rate_limit import check_rate_limit_bp
+from cache_engine import get_cache_or_generate_bp
+from business_config import get_business_settings_bp
+from message_retry import safe_openai_call_bp
+from logging_setup import logger_bp
+from payments import bp as payments_bp
+from channels import bp as channels_bp
+from dashboard_api import bp as dashboard_bp
+from channels.facebook import facebook_bp
+from channels.instagram import instagram_bp
+from channels.sms import sms_bp
 
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# --- load env ---
 load_dotenv()
 
-# --- config (env-driven) ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -38,29 +47,34 @@ WINDOW_PER_SECONDS = int(os.getenv("WINDOW_PER_SECONDS", 60))
 BUDGET_MONTHLY_USD = float(os.getenv("BUDGET_MONTHLY_USD", 50.0))
 EST_COST_PER_CALL_USD = float(os.getenv("EST_COST_PER_CALL_USD", 0.002))
 
-# Media limits
-MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_BYTES", 5 * 1024 * 1024))  # 5 MB
+MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_BYTES", 5 * 1024 * 1024))
 
-# Operational flags
 ENABLE_TWILIO_VALIDATION = os.getenv("ENABLE_TWILIO_VALIDATION", "1") != "0"
 
-# --- logging ---
 logger = logging.getLogger("reficulbot")
 logger.setLevel(logging.INFO)
 log_handler = RotatingFileHandler("app.log", maxBytes=5 * 1024 * 1024, backupCount=5)
 log_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 log_handler.setFormatter(log_formatter)
 logger.addHandler(log_handler)
-# console handler
 ch = logging.StreamHandler()
 ch.setFormatter(log_formatter)
 logger.addHandler(ch)
 
-# avoid logging secrets accidentally
 logger.info("Starting ReficulBot (single-file)")
 
-# --- Flask + OpenAI client ---
 app = Flask(__name__)
+app.register_blueprint(rate_limit_bp)
+app.register_blueprint(cache_engine_bp)
+app.register_blueprint(business_config_bp)
+app.register_blueprint(logging_setup_bp)
+app.register_blueprint(message_retry_bp)
+app.register_blueprint(payments_bp)
+app.register_blueprint(channels_bp)
+app.register_blueprint(dashboard_bp)
+app.register_blueprint(facebook_bp, url_prefix="/api")
+app.register_blueprint(instagram_bp, url_prefix="/api")
+app.register_blueprint(sms_bp, url_prefix="/api")
 
 if OpenAI and OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -69,20 +83,17 @@ else:
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY missing - AI fallback disabled.")
 
-# --- default faqs ---
 DEFAULT_FAQS = {
     "hours": "We are open Mon-Sat, 9am-6pm.",
     "pricing": "Please check our website for the latest pricing.",
     "shipping": "Orders are delivered within 3-5 business days."
 }
 
-# --- helpers: sqlite connection with pragmas ---
 def get_db_conn():
     """
     Return a new sqlite3 connection tuned for concurrent access.
     Callers must close the connection.
     """
-    # Using check_same_thread=False to be safer if running under multithreaded WSGI.
     conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
@@ -91,18 +102,16 @@ def get_db_conn():
         cur.execute("PRAGMA synchronous=NORMAL;")
         cur.execute("PRAGMA temp_store=MEMORY;")
         cur.execute("PRAGMA foreign_keys=ON;")
-        cur.execute("PRAGMA busy_timeout = 30000;")  # 30s
+        cur.execute("PRAGMA busy_timeout = 30000;")
         cur.close()
     except Exception:
         logger.exception("Failed to set SQLite pragmas")
     return conn
 
-# --- DB init and migrations ---
 def init_db():
     conn = get_db_conn()
     c = conn.cursor()
 
-    # tables
     c.execute("""
     CREATE TABLE IF NOT EXISTS leads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,7 +217,6 @@ def init_db():
 
     conn.commit()
 
-    # indexes (idempotent)
     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_business ON messages(sender, business_id);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_faqs_business_key ON faqs(business_id, key);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ai_cache_hash ON ai_cache(prompt_hash);")
@@ -242,10 +250,8 @@ def ensure_monthly_usage_row():
         conn.commit()
     conn.close()
 
-# initialize DB
 init_db()
 
-# --- rate limiting helpers ---
 def _rl_key(scope, identifier):
     return f"rl:{scope}:{identifier}"
 
@@ -287,7 +293,6 @@ def check_and_increment_rate_limit(scope, identifier, limit, window_seconds=WIND
     finally:
         conn.close()
 
-# --- ai cache helpers ---
 def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
@@ -311,7 +316,6 @@ def ai_cache_set(prompt: str, response: str):
     conn = get_db_conn()
     c = conn.cursor()
     try:
-        # Insert or replace; keep hits increasing
         c.execute("""
             INSERT INTO ai_cache (prompt_hash, prompt, response, hits, last_used)
             VALUES (?, ?, ?, COALESCE((SELECT hits FROM ai_cache WHERE prompt_hash = ?), 0) + 1, CURRENT_TIMESTAMP)
@@ -323,7 +327,6 @@ def ai_cache_set(prompt: str, response: str):
     finally:
         conn.close()
 
-# --- ai usage tracking ---
 def record_ai_call():
     now = time.localtime()
     y, m = now.tm_year, now.tm_mon
@@ -343,7 +346,6 @@ def record_ai_call():
     finally:
         conn.close()
 
-# --- dead-letter logging ---
 def log_dead_letter(sender, business_id, message, error_text):
     try:
         conn = get_db_conn()
@@ -356,7 +358,6 @@ def log_dead_letter(sender, business_id, message, error_text):
     finally:
         conn.close()
 
-# --- OpenAI call with retry/backoff + caching ---
 def call_openai_with_retry(prompt, max_retries=3, max_tokens=350):
     cached = ai_cache_get(prompt)
     if cached:
@@ -372,7 +373,6 @@ def call_openai_with_retry(prompt, max_retries=3, max_tokens=350):
     for attempt in range(1, max_retries + 1):
         try:
             logger.info("OpenAI call attempt %s", attempt)
-            # using chat completion style
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
@@ -405,7 +405,6 @@ def call_openai_with_retry(prompt, max_retries=3, max_tokens=350):
     logger.error("OpenAI calls exhausted. Last error: %s", last_err)
     return None, False
 
-# --- existing features: fetch_faq, insert_message, business lookup, lead flow, menu ---
 def fetch_faq(business_id, key):
     if not key:
         return None
@@ -453,7 +452,6 @@ def get_business_id_from_twilio(to_number):
         logger.exception("get_business_id_from_twilio failed")
         return None
 
-# lead flow
 def handle_lead_flow(sender, business_id, incoming_msg):
     if not business_id:
         return None
@@ -524,11 +522,9 @@ def handle_command(lower_text, sender, business_id):
     if lower_text in ("3", "shipping"):
         return fetch_faq(business_id, "shipping") or DEFAULT_FAQS["shipping"], True
     if lower_text in ("4", "human"):
-        # here we might notify staff via webhook/email in future
         return "Okay — we've notified the business. Someone will contact you soon.", True
     return None, False
 
-# media download and transcription
 _temp_files = set()
 def _register_temp(path):
     _temp_files.add(path)
@@ -552,7 +548,6 @@ def download_twilio_media(media_url):
     try:
         with requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), stream=True, timeout=30) as r:
             r.raise_for_status()
-            # check content-length
             cl = r.headers.get("Content-Length")
             if cl and int(cl) > MAX_MEDIA_BYTES:
                 logger.warning("Media too large: %s bytes", cl)
@@ -587,7 +582,6 @@ def transcribe_audio_file(local_path):
     try:
         with open(local_path, "rb") as f:
             transcript = client.audio.transcriptions.create(model="whisper-1", file=f)
-        # defensive extraction
         text = None
         if getattr(transcript, "text", None):
             text = transcript.text
@@ -603,7 +597,6 @@ def transcribe_audio_file(local_path):
         logger.exception("transcribe_audio_file failed")
         return None
 
-# --- security helpers ---
 def require_admin():
     token = request.headers.get("Authorization", "")
     if not token.startswith("Bearer "):
@@ -612,21 +605,14 @@ def require_admin():
     if not ADMIN_TOKEN or not hmac.compare_digest(provided, ADMIN_TOKEN):
         abort(401)
 
-# Optional Twilio signature validation (improves security for webhooks).
-# If ENABLE_TWILIO_VALIDATION is True and TWILIO_AUTH_TOKEN is set, validate signature.
 def validate_twilio_request():
-    # Minimal safe implementation: skip if not enabled or token missing
     if not ENABLE_TWILIO_VALIDATION or not TWILIO_AUTH_TOKEN:
         return True
-    # Twilio provides X-Twilio-Signature header + request URL + params to validate.
-    # Full validation requires twilio SDK; for now, warn and skip gracefully.
-    # You can implement full validation via twilio.request_validator.RequestValidator
+
     return True
 
-# --- Webhook: main flow ---
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # minimal Twilio validation hook
     if not validate_twilio_request():
         logger.warning("Twilio request validation failed")
         abort(403)
@@ -635,11 +621,9 @@ def webhook():
     sender = request.form.get("From", "unknown")
     to_number = request.form.get("To")
 
-    # generate request id for logs
     req_id = str(uuid.uuid4())[:8]
     logger.info("[%s] Incoming from %s -> %s: %s", req_id, sender, to_number, (incoming_msg[:200] + ("..." if len(incoming_msg) > 200 else "")))
 
-    # rate-limit per sender
     allowed_sender, rem = check_and_increment_rate_limit("sender", sender, PER_SENDER_LIMIT, WINDOW_PER_SECONDS)
     if not allowed_sender:
         logger.warning("[%s] Sender %s rate-limited", req_id, sender)
@@ -661,7 +645,6 @@ def webhook():
     resp = MessagingResponse()
     reply = resp.message()
 
-    # welcome logic - if no prior messages for sender+business, optionally send welcome; but do NOT swallow user's message:
     try:
         conn = get_db_conn()
         c = conn.cursor()
@@ -672,10 +655,7 @@ def webhook():
             c.execute("SELECT welcome_message FROM businesses WHERE id = ?", (business_id,))
             br = c.fetchone()
             if br and br["welcome_message"]:
-                # send welcome as part of combined reply (so we don't drop user's question)
                 welcome_msg = br["welcome_message"]
-                # continue to process incoming message; but include welcome prefix
-                # We'll prefix the AI/faq reply with the welcome message followed by newline
                 welcome_prefix = welcome_msg + "\n\n"
             else:
                 welcome_prefix = ""
@@ -686,7 +666,6 @@ def webhook():
         logger.exception("[%s] Welcome message logic failed", req_id)
         welcome_prefix = ""
 
-    # handle media (voice)
     num_media = int(request.values.get("NumMedia", 0))
     media_text = None
     if num_media > 0:
@@ -726,7 +705,6 @@ def webhook():
 
     lower = incoming_msg.lower().strip()
 
-    # 1) commands/menu
     cmd_reply, is_cmd = handle_command(lower, sender, business_id)
     if is_cmd:
         final = (welcome_prefix + cmd_reply).strip()
@@ -734,7 +712,6 @@ def webhook():
         insert_message(sender, business_id, incoming_msg, cmd_reply, True)
         return str(resp)
 
-    # 2) lead flow
     try:
         lead_reply = handle_lead_flow(sender, business_id, incoming_msg)
         if lead_reply:
@@ -745,7 +722,6 @@ def webhook():
     except Exception:
         logger.exception("[%s] Lead flow error", req_id)
 
-    # 3) FAQ - try direct match
     faq_resp = fetch_faq(business_id, lower)
     is_faq = faq_resp is not None
     if is_faq:
@@ -755,7 +731,6 @@ def webhook():
         insert_message(sender, business_id, incoming_msg, bot_reply, True)
         return str(resp)
 
-    # 4) AI fallback
     bot_reply, cached = call_openai_with_retry(incoming_msg, max_retries=3)
     if bot_reply is None:
         err_text = "OpenAI failed after retries"
@@ -769,7 +744,6 @@ def webhook():
     insert_message(sender, business_id, incoming_msg, bot_reply, False)
     return str(resp)
 
-# --- Admin endpoints ---
 @app.route("/admin/business", methods=["POST"])
 def admin_add_business():
     require_admin()
@@ -894,7 +868,6 @@ def admin_env():
         "monthly_budget_usd": BUDGET_MONTHLY_USD
     })
 
-# analytics
 @app.route("/analytics/top_questions", methods=["GET"])
 def analytics_top_questions():
     require_admin()
@@ -943,10 +916,8 @@ def analytics_ai_vs_faq():
     ai_count = int(row["ai_count"] or 0)
     return jsonify({"faq_count": faq_count, "ai_count": ai_count})
 
-# health
 @app.route("/health", methods=["GET"])
 def health():
-    # simple DB check
     ok = False
     try:
         conn = get_db_conn()
@@ -958,7 +929,6 @@ def health():
         ok = False
     return jsonify({"status": "ok" if ok else "error", "db": DB_PATH}), (200 if ok else 500)
 
-# --- run ---
 if __name__ == "__main__":
     logging.info("Starting app on port %s", PORT)
     app.run(host="0.0.0.0", port=PORT)
